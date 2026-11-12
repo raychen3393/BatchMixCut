@@ -1,0 +1,2 @@
+把 ffmpeg.exe 和 ffprobe.exe 放到这个文件夹里（和这个txt同一层）。
+下载方法见 README.md 第 3 节。

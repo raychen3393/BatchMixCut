@@ -1,0 +1,2 @@
+# 只装用得到的 PySide6 基础组件（完整版 PySide6 会多下载约 170MB 用不到的附加组件）
+PySide6-Essentials>=6.5

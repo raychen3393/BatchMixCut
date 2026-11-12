@@ -1,0 +1,11 @@
+# 运行环境、缓存、个人数据（不上传）
+.venv/
+data/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+error.log
+# ffmpeg 可执行文件体积大，由“双击运行.bat”自动下载
+ffmpeg/*.exe
