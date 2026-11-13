@@ -341,7 +341,7 @@ def probe(runner: ProcessRunner, path: str) -> MediaInfo:
         info.a_start = _start(a.get("start_time"))
         info.a_duration = (_float(a.get("duration")) or _mkv_tag_duration(a.get("tags"))
                            or _float(fmt.get("duration")))
-    if vd <= 0.05:
+    if vd <= 0.001:      # 只有 1 帧的素材（常用来做封面帧，30 帧时约 0.033 秒）是正常素材
         info.error = "无法确定视频时长（文件可能损坏）"
         return info
     if info.fps is None and info.avg_fps is None:

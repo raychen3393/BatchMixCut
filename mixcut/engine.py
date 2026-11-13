@@ -369,7 +369,7 @@ class MixEngine:
         def key(p):
             try:
                 size, mtime = file_sig(p)
-                return f"v3|{os.path.abspath(p)}|{size}|{mtime}"
+                return f"v4|{os.path.abspath(p)}|{size}|{mtime}"
             except OSError:
                 return None
 
@@ -538,12 +538,17 @@ class MixEngine:
                     self.log(f"    · {os.path.basename(os.path.dirname(p))}\\{os.path.basename(p)}（{why(p)}）")
                 if len(odd) > 30:
                     self.log(f"    … 还有 {len(odd) - 30} 条")
-            # 时间戳异常的素材即使强制也要修：不修的话成品会显示 20 多小时、后面全是空白
-            audio_fix = [p for p in needed if infos[p].ts_bad]
+            # 时间戳异常、或者时间基（时间的计数单位）和多数素材不一样的，即使强制也要重新封装：
+            # 不封装的话，成品时长会被放大几百倍（两分钟的成品显示 20 多小时、后面全是空白）
+            # 没有声音的素材也要补一条静音：否则它排在第一段时，整条成品都会没有声音
+            any_audio = any(infos[p].has_audio for p in needed)
+            audio_fix = [p for p in needed if infos[p].ts_bad or infos[p].v_timebase != dom_tb
+                         or (any_audio and not infos[p].has_audio)]
             bad_ts = set(audio_fix)
             direct, full_fix = [p for p in needed if p not in bad_ts], []
             if audio_fix:
-                self.log(f"  · 其中 {len(audio_fix)} 条时间戳异常，仍然会重新封装（画面不重新编码，很快）")
+                self.log(f"  · 其中 {len(audio_fix)} 条的时间基/时间戳和多数素材不一样，或者没有声音，仍然会重新封装"
+                         f"（画面不重新编码，很快；不封装的话成品会显示几十个小时或没有声音）")
         else:
             self.log(f"  · 直接使用原文件：{len(direct)} 条")
             if audio_fix:
@@ -556,13 +561,20 @@ class MixEngine:
                          "，".join(f"{k} {v} 条" for k, v in reasons.most_common(4)) + "）")
 
         clip_path = {p: p for p in direct}
+        fixers = []      # 用到时才创建；后面“成品时长不对 → 自动重做”也用它
+
+        def get_fixer(enc="libx264", hw=False):
+            if not fixers:
+                target = DirectTarget(dom_v[1], dom_v[2], dom_fps, dom_v[3], dom_a[1], dom_a[2], enc,
+                                      cfg.quality, cfg.speed, timescale)
+                fixers.append(DirectFixer(target, self.runner,
+                                          HwDecode(hw_decode_for(enc) if hw else "", self.log)))
+            return fixers[0]
+
         if audio_fix or full_fix:
             enc = resolve_encoder(self.runner, cfg.encoder, self.log, cfg.speed) if full_fix else "libx264"
             self._cap_for_gpu(enc)
-            target = DirectTarget(dom_v[1], dom_v[2], dom_fps, dom_v[3], dom_a[1], dom_a[2], enc,
-                                  cfg.quality, cfg.speed, timescale)
-            fixer = DirectFixer(target, self.runner,
-                                HwDecode(hw_decode_for(enc) if full_fix else "", self.log))
+            fixer = get_fixer(enc, bool(full_fix))
             if fixer.purge_stale():
                 self.log("规格变化，已清理旧的修正缓存")
             todo = [(p, "audio") for p in audio_fix] + [(p, "full") for p in full_fix]
@@ -631,7 +643,23 @@ class MixEngine:
         if need * 1.02 + 100 * 1024 * 1024 > free:
             raise RuntimeError(f"输出盘空间不足：需要约 {human_size(need * 1.02)}，"
                                f"剩余 {human_size(free)}")
-        self._generate(jobs, folders, history, summary, None)
+
+        def repair(job, level):
+            """成品时长不对时的兜底：把这一条用到的素材处理后再拼一次。
+            level 1：原样使用的素材重新封装（统一时间基、时间归零，画面不重新编码）；
+            level 2：全部重新编码成统一规格（慢，但最稳）。"""
+            fixer = get_fixer()
+            new = []
+            for c in job:
+                self._check_stop()
+                if level == 1 and c.path != c.src:
+                    new.append(c)           # 已经处理过的不重复处理
+                    continue
+                path = fixer.fix(infos[c.src], "audio" if level == 1 else "full")
+                new.append(CachedClip(c.src, path, "", c.duration, os.path.getsize(path), "direct", c.moov))
+            return new
+
+        self._generate(jobs, folders, history, summary, None, repair)
         return True
 
     def _log_ts_bad(self, paths, infos):
@@ -701,7 +729,7 @@ class MixEngine:
                 mx = max(mx, int(m.group(1)))
         return mx + 1
 
-    def _generate(self, jobs, folders, history, summary, spec):
+    def _generate(self, jobs, folders, history, summary, spec, repair=None):
         cfg = self.cfg
         total = len(jobs)
         if total == 0:
@@ -789,6 +817,25 @@ class MixEngine:
                             name, out = out_of(i)
                             job = jobs[i]
                             bad = _check_duration(out, job, slow, cfg.trans_dur)
+                            if bad and repair is not None:
+                                # 兜底：先把素材重新封装后重拼；还不行就把素材重新编码后再拼
+                                first_bad = bad
+                                for level in (1, 2):
+                                    try:
+                                        job2 = repair(job, level)
+                                        concat_mod.concat_direct(self.runner, job2, out, work_dir, 0)
+                                        bad = _check_duration(out, job2, slow, cfg.trans_dur)
+                                    except Cancelled:
+                                        raise
+                                    except Exception as e:  # noqa
+                                        bad = f"重做失败：{e}"
+                                    if not bad:
+                                        summary["repaired"] = summary.get("repaired", 0) + 1
+                                        self.log(f"  · {name} 第一次拼出来时长不对（{first_bad}），已自动"
+                                                 + ("重新封装素材" if level == 1 else "重新编码素材")
+                                                 + "后重做，现在正常。素材："
+                                                 + "、".join(os.path.basename(c.src) for c in job))
+                                        break
                             if bad:
                                 concat_mod._rm(out)
                                 summary["failed"] += 1
