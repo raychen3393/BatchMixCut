@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Optional
 
-from .utils import app_dir
+from .utils import app_dir, data_root
 
 IS_WIN = os.name == "nt"
 _CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
@@ -63,6 +63,59 @@ def _popen_extra():
 
 class Cancelled(Exception):
     pass
+
+
+# ---------------- 显卡解码 ----------------
+
+def hw_decode_for(enc: str) -> str:
+    """转码时用哪种显卡解码。能用显卡编码，说明显卡和驱动是好的，解码也交给它
+    （H.265 / 4K 素材的解码很吃 CPU）。返回空字符串 = 用 CPU 解码。
+    环境变量 MIXCUT_HWDEC 可以强制指定（off = 关闭）。"""
+    env = os.environ.get("MIXCUT_HWDEC", "").strip().lower()
+    if env:
+        return "" if env in ("off", "0", "none") else env
+    if enc == "h264_nvenc":
+        return "cuda"
+    if enc in ("h264_amf", "h264_qsv") and IS_WIN:
+        return "d3d11va"
+    return ""
+
+
+class HwDecode:
+    """带显卡解码运行转码命令；显卡解码失败就自动改用 CPU 解码重试一次。
+    连续失败且从没成功过（驱动或 ffmpeg 版本不支持）时，本次任务不再尝试，避免每条都白跑一遍。"""
+
+    def __init__(self, mode: str = "", log=None):
+        self.mode = mode or ""
+        self.log = log or (lambda m: None)
+        self._ok = 0
+        self._bad = 0
+        self._lock = threading.Lock()
+        if self.mode:
+            self.log(f"转码时用显卡解码（{self.mode}），个别素材不支持时自动改用 CPU")
+
+    def run(self, runner, build):
+        """build(hw_args) -> 完整的 ffmpeg 参数。返回 (退出码, 输出, 错误信息)"""
+        with self._lock:
+            mode = self.mode
+        if mode:
+            code, out, err = runner.run(build(["-hwaccel", mode]))
+            if code == 0:
+                with self._lock:
+                    self._ok += 1
+                return code, out, err
+            code2, out2, err2 = runner.run(build([]))
+            if code2 == 0:      # CPU 解码能成功，说明问题出在显卡解码上（而不是素材本身坏了）
+                off = False
+                with self._lock:
+                    self._bad += 1
+                    if self._ok == 0 and self._bad >= 2 and self.mode:
+                        self.mode, off = "", True
+                if off:
+                    reason = (err.strip().splitlines() or [""])[-1][:200]
+                    self.log(f"显卡解码不可用，本次改用 CPU 解码（{reason}）")
+            return code2, out2, err2
+        return runner.run(build([]))
 
 
 class ProcessRunner:
@@ -312,14 +365,58 @@ def encoder_test(runner: ProcessRunner, enc: str, speed: str = "normal"):
     return False, reason[:400]
 
 
+_enc_memo = {}      # 本次打开程序期间已经测过能用的显卡编码：(选项, 速度) -> 编码器
+
+
+def _enc_hint_path():
+    return os.path.join(data_root(), "encoder_hint.json")
+
+
+def _ffmpeg_id():
+    try:
+        st = os.stat(FFMPEG)
+        return f"{os.path.abspath(FFMPEG)}|{st.st_size}|{st.st_mtime_ns}"
+    except (OSError, TypeError):
+        return ""
+
+
+def _load_enc_hint():
+    try:
+        with open(_enc_hint_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("ffmpeg") == _ffmpeg_id() and d.get("enc") in HW_ORDER:
+            return d["enc"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _save_enc_hint(enc):
+    try:
+        with open(_enc_hint_path(), "w", encoding="utf-8") as f:
+            json.dump({"ffmpeg": _ffmpeg_id(), "enc": enc}, f)
+    except OSError:
+        pass
+
+
 def resolve_encoder(runner: ProcessRunner, choice: str, log=print, speed: str = "normal") -> str:
     if choice == "libx264":
         return "libx264"
-    tried = [choice] if choice in HW_ORDER else HW_ORDER
+    memo = _enc_memo.get((choice, speed))
+    if memo:                 # 程序没关过，刚才测过能用：不再重测
+        return memo
+    tried = [choice] if choice in HW_ORDER else list(HW_ORDER)
+    hint = _load_enc_hint()  # 上次能用的那个排最前先试（仍然会试编一小段，驱动坏了/换了显卡能发现）
+    if hint in tried:
+        tried.remove(hint)
+        tried.insert(0, hint)
     failures = []
     for enc in tried:
         ok, reason = encoder_test(runner, enc, speed)
         if ok:
+            _enc_memo[(choice, speed)] = enc
+            if enc != hint:
+                _save_enc_hint(enc)
             return enc
         failures.append((enc, reason))
     for enc, reason in failures:

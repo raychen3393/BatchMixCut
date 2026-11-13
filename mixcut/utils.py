@@ -57,13 +57,34 @@ def natural_sorted(items):
 def list_videos(folder: str):
     """列出文件夹（不递归）中的视频文件，自然排序。
     用 scandir：列目录时系统已经返回“是不是文件”，不用逐个文件再查一次（网络盘上快很多）"""
+    files = []
     try:
         with os.scandir(folder) as it:
-            files = [e.path for e in it
-                     if os.path.splitext(e.name)[1].lower() in VIDEO_EXTS and e.is_file()]
+            for e in it:
+                if os.path.splitext(e.name)[1].lower() in VIDEO_EXTS and e.is_file():
+                    files.append(e.path)
+                    try:    # Windows 上列目录时已经带回了大小和修改时间，这里不会再访问一次硬盘/网络
+                        st = e.stat()
+                        _sig_cache[e.path] = (st.st_size, st.st_mtime_ns)
+                    except OSError:
+                        _sig_cache.pop(e.path, None)
     except OSError:
         return []
     return natural_sorted(files)
+
+
+# 文件“身份”（大小 + 修改时间）：扫描文件夹时记下，之后查缓存、算空间都直接用，
+# 不用为同一个文件反复去问硬盘（素材在网络盘上时，每问一次都是一次网络来回）
+_sig_cache = {}
+
+
+def file_sig(path: str):
+    """返回 (大小, 修改时间纳秒)。每次开始任务都会重新扫描文件夹，所以不会用到过期的数据。"""
+    sig = _sig_cache.get(path)
+    if sig is None:
+        st = os.stat(path)
+        sig = _sig_cache[path] = (st.st_size, st.st_mtime_ns)
+    return sig
 
 
 def list_subfolders(parent: str):

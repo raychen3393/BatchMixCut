@@ -16,12 +16,14 @@ import shutil
 from dataclasses import dataclass
 from fractions import Fraction
 
-from .ffmpeg_tools import (AUDIO_ARGS, FFMPEG, Cancelled, MediaInfo, ProcessRunner, probe,
+from .ffmpeg_tools import (AUDIO_ARGS, FFMPEG, Cancelled, HwDecode, MediaInfo, ProcessRunner, probe,
                            video_encoder_args)
-from .utils import data_root, norm_path, short_hash
+from .utils import data_root, file_sig, norm_path, short_hash
 
 PIPELINE_VERSION = "v4"
 AUDIO_SR = 44100
+# 缩放算法：bilinear 比 ffmpeg 默认的 bicubic 快，手机/竖屏视频缩放后肉眼看不出区别
+SCALE_FLAGS = "bilinear"
 
 
 @dataclass
@@ -62,10 +64,11 @@ def cache_root() -> str:
 
 
 class ClipCache:
-    def __init__(self, spec: TargetSpec, runner: ProcessRunner, log=print):
+    def __init__(self, spec: TargetSpec, runner: ProcessRunner, log=print, hw: HwDecode = None):
         self.spec = spec
         self.runner = runner
         self.log = log
+        self.hw = hw or HwDecode()
         self.fp = spec.fingerprint()
         self.dir = os.path.join(cache_root(), short_hash(self.fp, 16))
         os.makedirs(self.dir, exist_ok=True)
@@ -88,8 +91,8 @@ class ClipCache:
 
     @staticmethod
     def _key(src: str) -> str:
-        st = os.stat(src)
-        return short_hash(f"{norm_path(src)}|{st.st_size}|{st.st_mtime_ns}", 24)
+        size, mtime = file_sig(src)
+        return short_hash(f"{norm_path(src)}|{size}|{mtime}", 24)
 
     def lookup(self, src: str):
         try:
@@ -168,13 +171,13 @@ class ClipCache:
         n_samples = int(round(duration * AUDIO_SR))
 
         # 音频：重采样为 44100Hz 双声道，短了补静音、长了裁掉，采样数精确等于视频时长
-        inputs = ["-i", info.path]
+        extra_in = []
         if info.has_audio:
             af = (f"[0:a:0]aresample={AUDIO_SR}:async=1:first_pts=0,"
                   f"aformat=sample_fmts=s16:channel_layouts=stereo,"
                   f"apad,atrim=end_sample={n_samples},asetpts=PTS-STARTPTS[a]")
         else:
-            inputs += ["-f", "lavfi", "-i", f"anullsrc=r={AUDIO_SR}:cl=stereo"]
+            extra_in = ["-f", "lavfi", "-i", f"anullsrc=r={AUDIO_SR}:cl=stereo"]
             af = (f"[1:a]aformat=sample_fmts=s16:channel_layouts=stereo,"
                   f"atrim=end_sample={n_samples},asetpts=PTS-STARTPTS[a]")
         audio_out = ["-map", "[a]", "-c:a", "pcm_s16le", "-ar", str(AUDIO_SR), "-ac", "2",
@@ -183,23 +186,30 @@ class ClipCache:
         if skip:
             mode = "remux"
             # 视频直接复制（规格与缓存完全一致），只生成音频
-            args = [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y", *inputs,
-                    "-filter_complex", af,
-                    "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-an",
-                    "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", tmp_ts, *audio_out]
+            def build(_hw):     # 视频不解码，用不上显卡解码
+                return [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y",
+                        "-i", info.path, *extra_in, "-filter_complex", af,
+                        "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-an",
+                        "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", tmp_ts, *audio_out]
         else:
             mode = "transcode"
-            vf = (f"[0:v:0]scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            vf = (f"[0:v:0]scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+                  f":flags={SCALE_FLAGS},"
                   f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={s.fps},format=yuv420p,"
                   f"tpad=stop_mode=clone:stop_duration=1,trim=end_frame={n_frames},"
                   f"setpts=PTS-STARTPTS[v]")
-            args = [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y", *inputs,
-                    "-filter_complex", f"{vf};{af}",
-                    "-map", "[v]", *video_encoder_args(s.encoder, s.fps, s.quality, s.speed),
-                    "-pix_fmt", "yuv420p", "-an",
-                    "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", tmp_ts, *audio_out]
+
+            def build(hw):
+                return [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y",
+                        *hw, "-i", info.path, *extra_in, "-filter_complex", f"{vf};{af}",
+                        "-map", "[v]", *video_encoder_args(s.encoder, s.fps, s.quality, s.speed),
+                        "-pix_fmt", "yuv420p", "-an",
+                        "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", tmp_ts, *audio_out]
         try:
-            code, _o, err = self.runner.run(args)
+            if skip:
+                code, _o, err = self.runner.run(build([]))
+            else:
+                code, _o, err = self.hw.run(self.runner, build)
         except Cancelled:
             _silent_remove(tmp_ts)
             _silent_remove(tmp_wav)
@@ -251,9 +261,10 @@ class DirectTarget:
 
 
 class DirectFixer:
-    def __init__(self, target: DirectTarget, runner: ProcessRunner):
+    def __init__(self, target: DirectTarget, runner: ProcessRunner, hw: HwDecode = None):
         self.t = target
         self.runner = runner
+        self.hw = hw or HwDecode()
         self.dir = os.path.join(cache_root(), "direct_" + short_hash(target.fingerprint(), 16))
         os.makedirs(self.dir, exist_ok=True)
 
@@ -270,20 +281,20 @@ class DirectFixer:
 
     def fix(self, info: MediaInfo, kind: str) -> str:
         """kind: audio = 视频直接复制、只重做音频；full = 视频也转成多数素材的规格。返回修正后文件路径"""
-        st = os.stat(info.path)
-        key = short_hash(f"{norm_path(info.path)}|{st.st_size}|{st.st_mtime_ns}|{kind}", 24)
+        size, mtime = file_sig(info.path)
+        key = short_hash(f"{norm_path(info.path)}|{size}|{mtime}|{kind}", 24)
         out = os.path.join(self.dir, key + ".mp4")
         if os.path.isfile(out) and os.path.getsize(out) > 0:
             return out
         tmp = os.path.join(self.dir, key + ".part.mp4")
         t = self.t
         layout = "mono" if t.channels == 1 else "stereo"
-        inputs = ["-i", info.path]
+        extra_in = []
         if info.has_audio:
             a_src = "[0:a:0]"
         else:
-            inputs += ["-f", "lavfi", "-t", f"{info.v_duration + 1:.3f}", "-i",
-                       f"anullsrc=r={t.sample_rate}:cl={layout}"]
+            extra_in = ["-f", "lavfi", "-t", f"{info.v_duration + 1:.3f}", "-i",
+                        f"anullsrc=r={t.sample_rate}:cl={layout}"]
             a_src = "[1:a]"
         af = (f"{a_src}aresample={t.sample_rate}:async=1:first_pts=0,"
               f"aformat=sample_fmts=fltp:channel_layouts={layout},apad[a]")
@@ -292,21 +303,26 @@ class DirectFixer:
         common_tail = ["-c:a", "aac", "-b:a", "128k", "-ar", str(t.sample_rate), "-ac", str(t.channels),
                        "-t", dur, "-video_track_timescale", str(t.timescale),
                        "-movflags", "+faststart", "-f", "mp4", tmp]
-        if kind == "audio":
-            args = [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y", *inputs,
-                    "-filter_complex", af, "-map", "0:v:0", "-map", "[a]", "-c:v", "copy",
-                    *common_tail]
-        else:
-            W, H = t.width, t.height
-            vf = (f"[0:v:0]scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-                  f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={t.fps},"
-                  f"format={t.pix_fmt}[v]")
-            args = [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y", *inputs,
-                    "-filter_complex", f"{vf};{af}", "-map", "[v]", "-map", "[a]",
-                    *video_encoder_args(t.encoder, t.fps, t.quality, t.speed),
-                    "-pix_fmt", t.pix_fmt, *common_tail]
         try:
-            code, _o, err = self.runner.run(args)
+            if kind == "audio":     # 视频不解码，用不上显卡解码
+                code, _o, err = self.runner.run(
+                    [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y", "-i", info.path, *extra_in,
+                     "-filter_complex", af, "-map", "0:v:0", "-map", "[a]", "-c:v", "copy",
+                     *common_tail])
+            else:
+                W, H = t.width, t.height
+                vf = (f"[0:v:0]scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+                      f":flags={SCALE_FLAGS},"
+                      f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={t.fps},"
+                      f"format={t.pix_fmt}[v]")
+
+                def build(hw):
+                    return [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y",
+                            *hw, "-i", info.path, *extra_in,
+                            "-filter_complex", f"{vf};{af}", "-map", "[v]", "-map", "[a]",
+                            *video_encoder_args(t.encoder, t.fps, t.quality, t.speed),
+                            "-pix_fmt", t.pix_fmt, *common_tail]
+                code, _o, err = self.hw.run(self.runner, build)
         except Cancelled:
             _silent_remove(tmp)
             raise

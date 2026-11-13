@@ -19,11 +19,11 @@ from typing import Callable, List, Optional
 from . import concat as concat_mod
 from . import ffmpeg_tools as fft
 from .combo import ComboPlanner, code_to_indices, total_combos
-from .ffmpeg_tools import (ENCODER_LABELS, Cancelled, MediaInfo, ProcessRunner, check_ffmpeg, probe,
-                           resolve_encoder)
+from .ffmpeg_tools import (ENCODER_LABELS, Cancelled, HwDecode, MediaInfo, ProcessRunner, check_ffmpeg,
+                           hw_decode_for, probe, resolve_encoder)
 from .history import History
 from .preprocess import CachedClip, ClipCache, DirectFixer, DirectTarget, TargetSpec, cache_root
-from .utils import (data_root, dir_size, disk_kind, free_space, human_size, is_network_path,
+from .utils import (data_root, dir_size, disk_kind, file_sig, free_space, human_size, is_network_path,
                     list_videos, norm_path, short_hash)
 
 
@@ -198,7 +198,7 @@ class MixEngine:
         self.log(f"统一规格：{spec.describe()}（{ENCODER_LABELS.get(enc, enc)}）")
 
         # 5. 预处理 + 缓存
-        cache = ClipCache(spec, self.runner, self.log)
+        cache = ClipCache(spec, self.runner, self.log, HwDecode(hw_decode_for(enc), self.log))
         removed = cache.purge_stale()
         if removed:
             self.log(f"编码参数变化，已作废并删除 {removed} 份旧缓存")
@@ -353,8 +353,8 @@ class MixEngine:
 
         def key(p):
             try:
-                st = os.stat(p)
-                return f"v2|{os.path.abspath(p)}|{st.st_size}|{st.st_mtime_ns}"
+                size, mtime = file_sig(p)
+                return f"v2|{os.path.abspath(p)}|{size}|{mtime}"
             except OSError:
                 return None
 
@@ -539,7 +539,8 @@ class MixEngine:
             self._cap_for_gpu(enc)
             target = DirectTarget(dom_v[1], dom_v[2], dom_fps, dom_v[3], dom_a[1], dom_a[2], enc,
                                   cfg.quality, cfg.speed, timescale)
-            fixer = DirectFixer(target, self.runner)
+            fixer = DirectFixer(target, self.runner,
+                                HwDecode(hw_decode_for(enc) if full_fix else "", self.log))
             if fixer.purge_stale():
                 self.log("规格变化，已清理旧的修正缓存")
             todo = [(p, "audio") for p in audio_fix] + [(p, "full") for p in full_fix]
@@ -587,8 +588,8 @@ class MixEngine:
         for p in needed:
             info = infos[p]
             path = clip_path[p]
-            try:
-                size = os.path.getsize(path)
+            try:    # 直接用的原文件：大小在扫描文件夹时已经拿到，不用再问一次硬盘/网络
+                size = file_sig(p)[0] if path == p else os.path.getsize(path)
             except OSError:
                 size = 0
             dur = max(info.v_duration, info.a_duration)
@@ -736,8 +737,10 @@ class MixEngine:
 
         workers = max(1, cfg.concat_workers)
         # 直接拼接模式下，一个 ffmpeg 进程一次拼多条（最多 4 条）；数量少时不合批，保证并行
+        # 机械硬盘例外：一个进程拼 4 条 = 同时读写好几个文件，磁头来回跳反而慢，所以一次只拼 1 条
         batch = 1
-        if not slow and jobs[0][0].mode == "direct":
+        on_hdd = "hdd" in {disk_kind(f) for f in folders} | {disk_kind(cfg.output_dir)}
+        if not slow and jobs[0][0].mode == "direct" and not on_hdd:
             batch = max(1, min(4, total // workers))
         chunks = [list(range(k, min(total, k + batch))) for k in range(0, total, batch)]
         try:
