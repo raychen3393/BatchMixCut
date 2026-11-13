@@ -79,6 +79,20 @@ def parse_fps(s: str) -> Fraction:
     return Fraction(s).limit_denominator(1001)
 
 
+def _check_duration(path, job, slow=False, trans_dur=0.0):
+    """读成品文件头里记录的时长，和素材时长之和比较。明显偏长（时间戳异常导致的空白）就返回说明，
+    正常返回空字符串。只读文件开头几十 KB，不启动 ffmpeg，几乎不花时间。读不出来就不判断。"""
+    actual = concat_mod.mp4_duration(path)
+    if actual is None:
+        return ""
+    expect = sum(c.duration for c in job)
+    if slow:
+        expect -= max(0, len(job) - 1) * min(trans_dur, 0.5)
+    if actual > expect * 1.1 + 2:
+        return f"应约 {expect:.0f} 秒，实际 {actual:.0f} 秒"
+    return ""
+
+
 class MixEngine:
     def __init__(self, cfg: JobConfig, cb: Callbacks = None):
         self.cfg = cfg
@@ -251,6 +265,7 @@ class MixEngine:
         self.log(f"最多组合 {total_combos(counts):,}，历史已用 {len(planner.used_sorted):,}，"
                  f"本批生成 {len(codes):,} 条")
 
+        self._log_ts_bad([p for p in needed if infos.get(p) and infos[p].ts_bad], infos)
         jobs = []
         for code in codes:
             idx = code_to_indices(code, counts)
@@ -354,7 +369,7 @@ class MixEngine:
         def key(p):
             try:
                 size, mtime = file_sig(p)
-                return f"v2|{os.path.abspath(p)}|{size}|{mtime}"
+                return f"v3|{os.path.abspath(p)}|{size}|{mtime}"
             except OSError:
                 return None
 
@@ -497,7 +512,7 @@ class MixEngine:
             info = infos[p]
             if self._vkey(info) != dom_v:
                 full_fix.append(p)
-            elif self._akey(info) != dom_a or info.v_timebase != dom_tb:
+            elif self._akey(info) != dom_a or info.v_timebase != dom_tb or info.ts_bad:
                 audio_fix.append(p)   # 视频流直接复制，只重新封装（统一时间基）+ 重做音频
             else:
                 direct.append(p)
@@ -506,6 +521,8 @@ class MixEngine:
 
         def why(p):
             info = infos[p]
+            if info.ts_bad:
+                return "时间戳异常"
             if self._vkey(info) != dom_v:
                 return self._vtext(self._vkey(info))
             if info.v_timebase != dom_tb:
@@ -521,7 +538,12 @@ class MixEngine:
                     self.log(f"    · {os.path.basename(os.path.dirname(p))}\\{os.path.basename(p)}（{why(p)}）")
                 if len(odd) > 30:
                     self.log(f"    … 还有 {len(odd) - 30} 条")
-            direct, audio_fix, full_fix = list(needed), [], []
+            # 时间戳异常的素材即使强制也要修：不修的话成品会显示 20 多小时、后面全是空白
+            audio_fix = [p for p in needed if infos[p].ts_bad]
+            bad_ts = set(audio_fix)
+            direct, full_fix = [p for p in needed if p not in bad_ts], []
+            if audio_fix:
+                self.log(f"  · 其中 {len(audio_fix)} 条时间戳异常，仍然会重新封装（画面不重新编码，很快）")
         else:
             self.log(f"  · 直接使用原文件：{len(direct)} 条")
             if audio_fix:
@@ -600,6 +622,7 @@ class MixEngine:
             except (TypeError, ValueError, ZeroDivisionError):
                 moov = 0
             clips[p] = CachedClip(p, path, "", dur, size, "direct", moov)
+        self._log_ts_bad([p for p in needed if infos[p].ts_bad], infos)
         jobs = [[clips[materials[k][i]] for k, i in enumerate(code_to_indices(code, counts))]
                 for code in codes]
         need = sum(sum(c.size for c in job) for job in jobs)
@@ -610,6 +633,16 @@ class MixEngine:
                                f"剩余 {human_size(free)}")
         self._generate(jobs, folders, history, summary, None)
         return True
+
+    def _log_ts_bad(self, paths, infos):
+        if not paths:
+            return
+        self.log(f"⚠ 有 {len(paths)} 条素材时间戳异常（画面和声音的起点对不上），已自动修正：")
+        for p in paths[:20]:
+            self.log(f"    · {os.path.basename(os.path.dirname(p))}\\{os.path.basename(p)}"
+                     f"（相差 {infos[p].ts_gap:.0f} 秒）")
+        if len(paths) > 20:
+            self.log(f"    … 还有 {len(paths) - 20} 条")
 
     def _decide_exceed(self, folders, valid):
         counts = [len(v) for v in valid]
@@ -755,6 +788,13 @@ class MixEngine:
                                 continue
                             name, out = out_of(i)
                             job = jobs[i]
+                            bad = _check_duration(out, job, slow, cfg.trans_dur)
+                            if bad:
+                                concat_mod._rm(out)
+                                summary["failed"] += 1
+                                self.log(f"⚠ {name} 时长不对（{bad}），已删除。用到的素材："
+                                         + "、".join(os.path.basename(c.src) for c in job))
+                                continue
                             names = [os.path.basename(c.src) for c in job]
                             history.append(names, name)
                             rows.append((start + i, name, [c.src for c in job]))

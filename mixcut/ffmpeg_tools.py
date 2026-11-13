@@ -181,7 +181,23 @@ class MediaInfo:
     sample_rate: int = 0
     channels: int = 0
     a_duration: float = 0.0
+    v_start: float = 0.0        # 视频流起点（秒）
+    a_start: float = 0.0        # 音频流起点（秒）
+    f_duration: float = 0.0     # 容器记录的总时长
     extra: dict = field(default_factory=dict)
+
+    @property
+    def ts_gap(self) -> float:
+        """时间戳异常的程度（秒）：画面和声音的起点相差多少，或容器总时长比实际内容长多少。
+        常见于直播录屏、剪切过的视频、部分 App 导出。直接拼接会凭空多出一大段空白（成品显示 20 多小时）"""
+        gap = abs(self.v_start - self.a_start) if self.has_audio else 0.0
+        if self.f_duration > 0:
+            gap = max(gap, self.f_duration - max(self.v_duration, self.a_duration))
+        return gap
+
+    @property
+    def ts_bad(self) -> bool:
+        return self.ts_gap > 1.0
 
 
 def _frac(s):
@@ -198,6 +214,14 @@ def _float(s):
     try:
         v = float(s)
         return v if v > 0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _start(s):
+    """起点可能是负数，不能用 _float"""
+    try:
+        return float(s)
     except (TypeError, ValueError):
         return 0.0
 
@@ -295,12 +319,16 @@ def probe(runner: ProcessRunner, path: str) -> MediaInfo:
     info.sar = v.get("sample_aspect_ratio", "") or ""
     info.v_extradata = v.get("extradata_hash", "") or ""
     info.v_timebase = v.get("time_base", "") or ""
+    info.v_start = _start(v.get("start_time"))
+    info.f_duration = _float(fmt.get("duration"))
     vd = _float(v.get("duration"))
     fmt_name = fmt.get("format_name", "")
     if vd <= 0 or "avi" in fmt_name or "flv" in fmt_name:
         # 视频流没写时长（mkv/flv 常见），或容器头信息不可靠（avi/flv）：
         # 不能用整个文件的时长（会被更长的音频撑大），改为扫描视频包
         vd = _packet_duration(runner, path, v.get("index", 0)) or vd
+    if "avi" in fmt_name or "flv" in fmt_name:
+        info.f_duration = 0.0
     if vd <= 0:
         vd = _mkv_tag_duration(v.get("tags")) or _float(fmt.get("duration"))
     info.v_duration = vd
@@ -310,6 +338,7 @@ def probe(runner: ProcessRunner, path: str) -> MediaInfo:
         info.aprofile = a.get("profile", "")
         info.sample_rate = int(a.get("sample_rate") or 0)
         info.channels = int(a.get("channels") or 0)
+        info.a_start = _start(a.get("start_time"))
         info.a_duration = (_float(a.get("duration")) or _mkv_tag_duration(a.get("tags"))
                            or _float(fmt.get("duration")))
     if vd <= 0.05:

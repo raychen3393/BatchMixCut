@@ -172,8 +172,9 @@ class ClipCache:
 
         # 音频：重采样为 44100Hz 双声道，短了补静音、长了裁掉，采样数精确等于视频时长
         extra_in = []
+        a_reset = "asetpts=PTS-STARTPTS," if info.ts_bad else ""
         if info.has_audio:
-            af = (f"[0:a:0]aresample={AUDIO_SR}:async=1:first_pts=0,"
+            af = (f"[0:a:0]{a_reset}aresample={AUDIO_SR}:async=1:first_pts=0,"
                   f"aformat=sample_fmts=s16:channel_layouts=stereo,"
                   f"apad,atrim=end_sample={n_samples},asetpts=PTS-STARTPTS[a]")
         else:
@@ -188,7 +189,7 @@ class ClipCache:
             # 视频直接复制（规格与缓存完全一致），只生成音频
             def build(_hw):     # 视频不解码，用不上显卡解码
                 return [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y",
-                        "-i", info.path, *extra_in, "-filter_complex", af,
+                        *_v_reset(info), "-i", info.path, *extra_in, "-filter_complex", af,
                         "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-an",
                         "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", tmp_ts, *audio_out]
         else:
@@ -229,6 +230,14 @@ class ClipCache:
                        "frames": n_frames, "size": size, "audio_size": asize, "mode": mode},
                       f, ensure_ascii=False)
         return CachedClip(info.path, ts, wav, duration, size, mode)
+
+
+def _v_reset(info: MediaInfo):
+    """时间戳异常的素材：视频直接复制时把画面起点挪回 0（ffmpeg 只会减去整个文件最早的起点）"""
+    if not info.ts_bad:
+        return []
+    off = info.v_start - min(info.v_start, info.a_start if info.has_audio else info.v_start)
+    return ["-itsoffset", f"{-off:.6f}"] if off > 0.001 else []
 
 
 def _silent_remove(p):
@@ -282,7 +291,8 @@ class DirectFixer:
     def fix(self, info: MediaInfo, kind: str) -> str:
         """kind: audio = 视频直接复制、只重做音频；full = 视频也转成多数素材的规格。返回修正后文件路径"""
         size, mtime = file_sig(info.path)
-        key = short_hash(f"{norm_path(info.path)}|{size}|{mtime}|{kind}", 24)
+        reset = info.ts_bad
+        key = short_hash(f"{norm_path(info.path)}|{size}|{mtime}|{kind}" + ("|ts0" if reset else ""), 24)
         out = os.path.join(self.dir, key + ".mp4")
         if os.path.isfile(out) and os.path.getsize(out) > 0:
             return out
@@ -296,7 +306,8 @@ class DirectFixer:
             extra_in = ["-f", "lavfi", "-t", f"{info.v_duration + 1:.3f}", "-i",
                         f"anullsrc=r={t.sample_rate}:cl={layout}"]
             a_src = "[1:a]"
-        af = (f"{a_src}aresample={t.sample_rate}:async=1:first_pts=0,"
+        a_reset = "asetpts=PTS-STARTPTS," if (reset and info.has_audio) else ""
+        af = (f"{a_src}{a_reset}aresample={t.sample_rate}:async=1:first_pts=0,"
               f"aformat=sample_fmts=fltp:channel_layouts={layout},apad[a]")
         # 注意：apad 是无限长的，不能用 -shortest（滤镜图里会一直写下去），按视频时长精确截止
         dur = f"{info.v_duration:.6f}"
@@ -306,7 +317,8 @@ class DirectFixer:
         try:
             if kind == "audio":     # 视频不解码，用不上显卡解码
                 code, _o, err = self.runner.run(
-                    [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y", "-i", info.path, *extra_in,
+                    [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y",
+                     *_v_reset(info), "-i", info.path, *extra_in,
                      "-filter_complex", af, "-map", "0:v:0", "-map", "[a]", "-c:v", "copy",
                      *common_tail])
             else:
@@ -314,7 +326,7 @@ class DirectFixer:
                 vf = (f"[0:v:0]scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2"
                       f":flags={SCALE_FLAGS},"
                       f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={t.fps},"
-                      f"format={t.pix_fmt}[v]")
+                      f"format={t.pix_fmt}" + (",setpts=PTS-STARTPTS" if reset else "") + "[v]")
 
                 def build(hw):
                     return [FFMPEG, "-hide_banner", "-v", "error", "-nostdin", "-y",

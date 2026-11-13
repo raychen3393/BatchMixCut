@@ -1,6 +1,7 @@
 """拼接：极速模式（concat demuxer + 流复制，不重新编码）与慢速模式（转场，需要重新编码）"""
 import os
 import random
+import struct
 from fractions import Fraction
 
 from .ffmpeg_tools import AUDIO_ARGS, FFMPEG, Cancelled, ProcessRunner, video_encoder_args
@@ -162,6 +163,46 @@ def concat_with_transitions(runner: ProcessRunner, clips, out_path, encoder: str
 def _input_error(err: str) -> bool:
     return any(k in err for k in ("Impossible to open", "Error during demuxing",
                                   "Error retrieving a packet"))
+
+
+def mp4_duration(path, limit=4 * 1024 * 1024):
+    """从 mp4 文件头的 moov/mvhd 里读总时长（秒）。成品的索引都放在文件开头，
+    所以通常只读几十 KB。读不出来（索引在末尾、文件异常）返回 None。"""
+    try:
+        with open(path, "rb") as f:
+            pos, size = 0, os.path.getsize(path)
+            while pos + 8 <= min(size, limit):
+                f.seek(pos)
+                head = f.read(16)
+                n, typ = struct.unpack(">I4s", head[:8])
+                hdr = 8
+                if n == 1:
+                    n, hdr = struct.unpack(">Q", head[8:16])[0], 16
+                elif n == 0:
+                    n = size - pos
+                if n < hdr:
+                    return None
+                if typ == b"moov":
+                    f.seek(pos + hdr)
+                    body = f.read(min(n - hdr, 1 << 16))
+                    i = 0
+                    while i + 8 <= len(body):
+                        bn, bt = struct.unpack(">I4s", body[i:i + 8])
+                        if bt == b"mvhd":
+                            ver = body[i + 8]
+                            if ver == 1:
+                                ts, dur = struct.unpack(">IQ", body[i + 28:i + 40])
+                            else:
+                                ts, dur = struct.unpack(">II", body[i + 20:i + 28])
+                            return dur / ts if ts else None
+                        if bn < 8:
+                            return None
+                        i += bn
+                    return None
+                pos += n
+    except (OSError, struct.error, IndexError, ValueError):
+        return None
+    return None
 
 
 def _rm(p):
