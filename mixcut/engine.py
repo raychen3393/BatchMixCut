@@ -644,6 +644,8 @@ class MixEngine:
             raise RuntimeError(f"输出盘空间不足：需要约 {human_size(need * 1.02)}，"
                                f"剩余 {human_size(free)}")
 
+        repair_lock = threading.Lock()
+
         def repair(job, level):
             """成品时长不对时的兜底：把这一条用到的素材处理后再拼一次。
             level 1：原样使用的素材重新封装（统一时间基、时间归零，画面不重新编码）；
@@ -655,7 +657,8 @@ class MixEngine:
                 if level == 1 and c.path != c.src:
                     new.append(c)           # 已经处理过的不重复处理
                     continue
-                path = fixer.fix(infos[c.src], "audio" if level == 1 else "full")
+                with repair_lock:
+                    path = fixer.fix(infos[c.src], "audio" if level == 1 else "full")
                 new.append(CachedClip(c.src, path, "", c.duration, os.path.getsize(path), "direct", c.moov))
             return new
 
@@ -772,28 +775,65 @@ class MixEngine:
             else:
                 concat_mod.concat_fast(self.runner, job, out, work_dir)
 
+        def verify(i):
+            """核对成品时长，不对就自动重做。在各自的拼接线程里并行执行，不让汇总那一步排队。
+            返回 (错误日志 或 None, 提示日志 或 None)"""
+            name, out = out_of(i)
+            job = jobs[i]
+            bad = _check_duration(out, job, slow, cfg.trans_dur)
+            if not bad:
+                return None, None
+            used = "、".join(os.path.basename(c.src) for c in job)
+            if repair is not None:
+                # 兜底：先把素材重新封装后重拼；还不行就把素材重新编码后再拼
+                first_bad = bad
+                for level in (1, 2):
+                    try:
+                        job2 = repair(job, level)
+                        concat_mod.concat_direct(self.runner, job2, out, work_dir, 0)
+                        bad = _check_duration(out, job2, slow, cfg.trans_dur)
+                    except Cancelled:
+                        raise
+                    except Exception as e:  # noqa
+                        bad = f"重做失败：{e}"
+                    if not bad:
+                        return None, (f"  · {name} 第一次拼出来时长不对（{first_bad}），已自动"
+                                      + ("重新封装素材" if level == 1 else "重新编码素材")
+                                      + f"后重做，现在正常。素材：{used}")
+            concat_mod._rm(out)
+            return f"⚠ {name} 时长不对（{bad}），已删除。用到的素材：{used}", None
+
         def work(idxs):
-            """处理一小批，返回 [(序号, 错误信息或 None)]"""
+            """处理一小批，返回 [(序号, 错误日志 或 None, 提示日志 或 None)]"""
             self._check_stop()
+            made = None
             if len(idxs) > 1:
                 try:
                     concat_mod.concat_direct_batch(self.runner, [(jobs[i], out_of(i)[1]) for i in idxs],
                                                    work_dir)
-                    return [(i, None) for i in idxs]
+                    made = [(i, None) for i in idxs]
                 except Cancelled:
                     raise
                 except Exception:  # noqa  整批失败 → 逐条重试，找出真正有问题的那条
-                    pass
+                    made = None
+            if made is None:
+                made = []
+                for i in idxs:
+                    self._check_stop()
+                    try:
+                        one(i)
+                        made.append((i, None))
+                    except Cancelled:
+                        raise
+                    except Exception as e:  # noqa
+                        made.append((i, f"⚠ 生成失败：{e}"))
             res = []
-            for i in idxs:
+            for i, err in made:
+                if err is not None:
+                    res.append((i, err, None))
+                    continue
                 self._check_stop()
-                try:
-                    one(i)
-                    res.append((i, None))
-                except Cancelled:
-                    raise
-                except Exception as e:  # noqa
-                    res.append((i, str(e)))
+                res.append((i, *verify(i)))
             return res
 
         workers = max(1, cfg.concat_workers)
@@ -804,44 +844,24 @@ class MixEngine:
         if not slow and jobs[0][0].mode == "direct" and not on_hdd:
             batch = max(1, min(4, total // workers))
         chunks = [list(range(k, min(total, k + batch))) for k in range(0, total, batch)]
+        if not slow:
+            self.log(f"拼接方式：同时 {workers} 路，每路一次拼 {batch} 条"
+                     + ("（素材盘或输出盘是机械硬盘）" if on_hdd and jobs[0][0].mode == "direct" else ""))
         try:
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = [ex.submit(work, ch) for ch in chunks]
                 try:
                     for fu in as_completed(futs):
-                        for i, err in fu.result():
+                        for i, err, note in fu.result():
+                            if note:
+                                summary["repaired"] = summary.get("repaired", 0) + 1
+                                self.log(note)
                             if err is not None:
                                 summary["failed"] += 1
-                                self.log(f"⚠ 生成失败：{err}")
+                                self.log(err)
                                 continue
                             name, out = out_of(i)
                             job = jobs[i]
-                            bad = _check_duration(out, job, slow, cfg.trans_dur)
-                            if bad and repair is not None:
-                                # 兜底：先把素材重新封装后重拼；还不行就把素材重新编码后再拼
-                                first_bad = bad
-                                for level in (1, 2):
-                                    try:
-                                        job2 = repair(job, level)
-                                        concat_mod.concat_direct(self.runner, job2, out, work_dir, 0)
-                                        bad = _check_duration(out, job2, slow, cfg.trans_dur)
-                                    except Cancelled:
-                                        raise
-                                    except Exception as e:  # noqa
-                                        bad = f"重做失败：{e}"
-                                    if not bad:
-                                        summary["repaired"] = summary.get("repaired", 0) + 1
-                                        self.log(f"  · {name} 第一次拼出来时长不对（{first_bad}），已自动"
-                                                 + ("重新封装素材" if level == 1 else "重新编码素材")
-                                                 + "后重做，现在正常。素材："
-                                                 + "、".join(os.path.basename(c.src) for c in job))
-                                        break
-                            if bad:
-                                concat_mod._rm(out)
-                                summary["failed"] += 1
-                                self.log(f"⚠ {name} 时长不对（{bad}），已删除。用到的素材："
-                                         + "、".join(os.path.basename(c.src) for c in job))
-                                continue
                             names = [os.path.basename(c.src) for c in job]
                             history.append(names, name)
                             rows.append((start + i, name, [c.src for c in job]))

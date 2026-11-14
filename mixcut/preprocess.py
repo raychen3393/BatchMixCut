@@ -110,6 +110,11 @@ class ClipCache:
             if (m.get("fingerprint") != self.fp or os.path.getsize(ts) != m.get("size")
                     or os.path.getsize(wav) != m.get("audio_size")):
                 return None
+            if m["size"] < 16 * 1024:       # 旧版留下的极短片段：补上空包，否则读不出来
+                _pad_tiny_ts(ts)
+                m["size"] = os.path.getsize(ts)
+                with open(meta, "w", encoding="utf-8") as f:
+                    json.dump(m, f, ensure_ascii=False)
             return CachedClip(src, ts, wav, float(m["duration"]), int(m["size"]), "cached")
         except (OSError, ValueError, KeyError):
             return None
@@ -222,6 +227,7 @@ class ClipCache:
             _silent_remove(tmp_wav)
             msg = (err.strip().splitlines() or ["未知错误"])[-1]
             raise RuntimeError(f"预处理失败：{msg}")
+        _pad_tiny_ts(tmp_ts)
         os.replace(tmp_ts, ts)
         os.replace(tmp_wav, wav)
         size, asize = os.path.getsize(ts), os.path.getsize(wav)
@@ -230,6 +236,21 @@ class ClipCache:
                        "frames": n_frames, "size": size, "audio_size": asize, "mode": mode},
                       f, ensure_ascii=False)
         return CachedClip(info.path, ts, wav, duration, size, mode)
+
+
+_TS_NULL = bytes([0x47, 0x1F, 0xFF, 0x10]) + b"\xff" * 184
+
+
+def _pad_tiny_ts(path, min_size=16 * 1024):
+    """只有两三帧的片段，.ts 文件太小（不到 2KB），ffmpeg 读的时候会把它误认成别的格式而打不开。
+    在末尾补一些“空包”（播放器和 ffmpeg 都会直接忽略），让它被正确识别。不影响画面和时长。"""
+    try:
+        size = os.path.getsize(path)
+        if size < min_size:
+            with open(path, "ab") as f:
+                f.write(_TS_NULL * ((min_size - size) // 188 + 1))
+    except OSError:
+        pass
 
 
 def _v_reset(info: MediaInfo):
